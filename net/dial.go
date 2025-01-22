@@ -16,6 +16,7 @@ package net
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sort"
@@ -51,7 +52,7 @@ func DialContext(ctx context.Context, addr string, opts ...DialOption) (c net.Co
 			}
 		}
 		if !support {
-			return nil, fmt.Errorf("ProxyType must be http or socks5 or ntlm, not [%s]", op.proxyType)
+			return nil, fmt.Errorf("ProxyType must be http or https or socks5 or ntlm, not [%s]", op.proxyType)
 		}
 	}
 
@@ -103,8 +104,26 @@ func dial(ctx context.Context, addr string, op dialOptions) (c net.Conn, err err
 		return dialer.DialContext(ctx, "tcp", addr)
 	case "kcp":
 		return dialKCPServer(addr)
+	case "https":
+		// Establish a TCP connection first
+		dialer := &net.Dialer{
+			Timeout:   op.timeout,
+			KeepAlive: op.keepAlive,
+		}
+		tcpConn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+
+		// Upgrade to TLS connection
+		tlsConn := tls.Client(tcpConn, op.tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			tcpConn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
 	default:
-		return nil, fmt.Errorf("unsupport protocol: %s", op.protocol)
+		return nil, fmt.Errorf("unsupported protocol: %s", op.protocol)
 	}
 }
 

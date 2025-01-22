@@ -30,7 +30,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-var supportedDialProxyTypes = []string{"socks5", "http", "ntlm"}
+var supportedDialProxyTypes = []string{"socks5", "http", "https", "ntlm"}
 
 type ProxyAuth struct {
 	Username string
@@ -70,6 +70,7 @@ type dialOptions struct {
 
 	afterHooks  []AfterHook
 	beforeHooks []BeforeHook
+	tlsConfig   *tls.Config
 }
 
 type BeforeHookFunc func(ctx context.Context, addr string) context.Context
@@ -137,6 +138,11 @@ func WithProxy(proxyType string, address string) DialOption {
 				conn, err := httpProxyAfterHook(ctx, c, addr)
 				return ctx, conn, err
 			}
+		case "https":
+			hook = func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
+				conn, err := httpsProxyAfterHook(ctx, c, addr)
+				return ctx, conn, err
+			}
 		case "ntlm":
 			hook = func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
 				conn, err := ntlmHTTPProxyAfterHook(ctx, c, addr)
@@ -151,6 +157,38 @@ func WithProxy(proxyType string, address string) DialOption {
 			})
 		}
 	})
+}
+
+func httpsProxyAfterHook(ctx context.Context, conn net.Conn, addr string) (net.Conn, error) {
+	meta := GetDialMetasFromContext(ctx)
+	proxyAuth, _ := meta.Value(proxyAuthKey).(*ProxyAuth)
+
+	req, err := http.NewRequest("CONNECT", "https://"+addr, nil)
+	if err != nil {
+		return nil, err
+	}
+	if proxyAuth != nil {
+		req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(proxyAuth.Username+":"+proxyAuth.Passwd)))
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	_ = req.Write(conn)
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("DialTcpByHttpsProxy error, StatusCode [%d]", resp.StatusCode)
+	}
+
+	// Upgrade to TLS connection
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	if err := tlsConn.Handshake(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
 }
 
 func WithProxyAuth(auth *ProxyAuth) DialOption {
@@ -175,6 +213,7 @@ func WithTLSConfigAndPriority(priority uint64, tlsConfig *tls.Config) DialOption
 			return
 		}
 
+		do.tlsConfig = tlsConfig
 		do.afterHooks = append(do.afterHooks, AfterHook{
 			Priority: priority,
 			Hook: func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
